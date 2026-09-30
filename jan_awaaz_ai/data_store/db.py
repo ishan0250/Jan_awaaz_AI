@@ -1,23 +1,6 @@
 """
 data_store/db.py
-
-THE FIX for the v2.5 bug: "citizen submits, officer's dashboard doesn't
-show it." That happened because tickets lived in st.session_state, which
-is scoped per browser session and never syncs across tabs/users.
-
-Rule for the whole codebase: NO page or module touches ticket data except
-through the functions in this file. Every page reads fresh from SQLite on
-every render. st.session_state is only ever used for transient UI state
-(form drafts, which tab is open, the fast-forward simulator clock) —
-never for ticket data itself.
-
-SQLite is used instead of raw JSON because:
-- it's still stdlib (sqlite3), zero new setup, still a single file you can
-  delete to reset your demo
-- it gives atomic writes, so a citizen submitting and an officer viewing
-  at the same moment can't corrupt the file
-- embeddings are stored as JSON text in a column, so we don't need a
-  vector DB for a 36-hour build
+Single source of truth for database interactions across the app.
 """
 
 import json
@@ -67,7 +50,7 @@ def _connect():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")  # safer concurrent read/write
+    conn.execute("PRAGMA journal_mode=WAL;")
     try:
         yield conn
         conn.commit()
@@ -82,7 +65,7 @@ def init_db() -> None:
 
 def _row_to_ticket(row: sqlite3.Row) -> Ticket:
     d = dict(row)
-    embedding = d.pop("embedding_json", None)  # not part of Ticket model
+    embedding = d.pop("embedding_json", None)
     d["is_fallback_routed"] = bool(d["is_fallback_routed"])
     d["citizen_verified"] = (None if d["citizen_verified"] is None
                               else bool(d["citizen_verified"]))
@@ -100,7 +83,7 @@ def insert_ticket(ticket: Ticket, embedding: Optional[list[float]] = None) -> No
     placeholders = ", ".join("?" for _ in d)
     with _connect() as conn:
         conn.execute(f"INSERT INTO tickets ({cols}) VALUES ({placeholders})",
-                      list(d.values()))
+                     list(d.values()))
 
 
 def update_ticket(ticket: Ticket) -> None:
@@ -112,7 +95,27 @@ def update_ticket(ticket: Ticket) -> None:
     set_clause = ", ".join(f"{k} = ?" for k in d.keys())
     with _connect() as conn:
         conn.execute(f"UPDATE tickets SET {set_clause} WHERE id = ?",
-                      list(d.values()) + [ticket_id])
+                     list(d.values()) + [ticket_id])
+
+
+def update_ticket_status(ticket_id: str, new_status: str, escalation_text: Optional[str] = None, citizen_verified: Optional[bool] = None) -> None:
+    """Explicit database helper to update ticket verification status."""
+    updates = ["status = ?"]
+    params = [new_status]
+
+    if escalation_text is not None:
+        updates.append("escalation_text = ?")
+        params.append(escalation_text)
+
+    if citizen_verified is not None:
+        updates.append("citizen_verified = ?")
+        params.append(int(citizen_verified))
+
+    params.append(ticket_id)
+    query = f"UPDATE tickets SET {', '.join(updates)} WHERE id = ?"
+
+    with _connect() as conn:
+        conn.execute(query, params)
 
 
 def get_ticket(ticket_id: str) -> Optional[Ticket]:
@@ -122,7 +125,7 @@ def get_ticket(ticket_id: str) -> Optional[Ticket]:
 
 
 def list_tickets(status: Optional[str] = None,
-                  department_code: Optional[str] = None) -> list[Ticket]:
+                 department_code: Optional[str] = None) -> list[Ticket]:
     """Always reads fresh from disk — this is what every page should call."""
     query = "SELECT * FROM tickets WHERE cluster_master_id IS NULL"
     params: list = []
@@ -140,11 +143,10 @@ def list_tickets(status: Optional[str] = None,
 
 
 def list_open_tickets_with_location() -> list[tuple[Ticket, Optional[list[float]]]]:
-    """Used by vector_clustering.py to check nearby existing tickets."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM tickets WHERE cluster_master_id IS NULL "
-            "AND status != 'resolved' AND latitude IS NOT NULL"
+            "AND status != 'closed' AND latitude IS NOT NULL"
         ).fetchall()
         out = []
         for row in rows:
@@ -155,6 +157,5 @@ def list_open_tickets_with_location() -> list[tuple[Ticket, Optional[list[float]
 
 
 def reset_db() -> None:
-    """Wipe all tickets — useful between demo runs. Does NOT delete the file."""
     with _connect() as conn:
         conn.execute("DELETE FROM tickets")

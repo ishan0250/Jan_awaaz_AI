@@ -1,98 +1,135 @@
 """
 core/ticket_pipeline.py
-
-The single function Streamlit pages should call to turn citizen input
-into a persisted ticket. This is the "Ingestion -> Perception -> Route ->
-Cluster -> Score" flow from the handbook, wired together end to end.
-
-Keeping this orchestration in core/ (not in pages/1_Citizen_Portal.py)
-means it's unit-testable and the UI file stays thin.
+Multimodal ticket extraction engine using Google Gemini API.
 """
 
-from core.ai_ingestion import extract_from_input
-from core.evidence_validator import validate_evidence
-from core.routing_engine import match_department
-from core.vector_clustering import embed_text, find_duplicate_match
-from core.scoring_engine import score_ticket
-from core.sla_engine import stamp_deadline
-from core.models import Ticket
-from data_store.db import insert_ticket, update_ticket, list_open_tickets_with_location
+import json
+import io
+import sqlite3
+import uuid
+from datetime import datetime
+from PIL import Image
+from google import genai
+from google.genai import types
+
+from config import GEMINI_API_KEY, DB_PATH, GEMINI_MULTIMODAL_MODEL
+
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+SYSTEM_PROMPT = """
+You are the intake extraction engine for Jan-Awaaz AI, an Indian civic grievance portal.
+Analyze the user's grievance input (text, image, or transcribed voice) and output a clean JSON object.
+
+Extract and categorize the issue strictly adhering to these JSON keys:
+1. "summary_en": Concise English summary of the civic problem.
+2. "department_key": One of ["pwd", "jal_shakti", "ulb", "discom"].
+3. "department_display": Official Indian authority name (e.g., "Jal Shakti / Municipal Water Board", "PWD / Road Infrastructure", "State DISCOM / Electricity Board", "Urban Local Bodies (ULB) / Sanitation").
+4. "urgency": Integer 1 to 5 (Immediate public threat level).
+5. "intensity": Integer 1 to 5 (Structural or physical damage level).
+6. "sla_hours": Standard SLA timeline in hours (24, 48, or 72 based on urgency).
+7. "rpi_score": Calculated Relative Priority Index (urgency * 10 + intensity * 5).
+8. "latitude": Estimated latitude float for the mentioned locality/landmark (or center of district if generic).
+9. "longitude": Estimated longitude float for the mentioned locality/landmark.
+"""
 
 
-def submit_ticket(client, *, text: str = "", input_channel: str = "web",
-                   input_modality: str = "text",
-                   audio_bytes: bytes | None = None, audio_mime_type: str = "audio/ogg",
-                   image_bytes: bytes | None = None, image_mime_type: str = "image/jpeg",
-                   latitude: float | None = None, longitude: float | None = None
-                   ) -> tuple[Ticket, bool]:
+def extract_ticket_details(user_text: str, state: str, district: str, location_note: str, image_bytes=None):
+    """Call Gemini Flash with multimodal inputs to extract structured ticket JSON."""
+
+    full_prompt = f"""
+    State: {state}
+    District/ULB: {district}
+    Detailed Address/Landmark: {location_note}
+    User Grievance Text: {user_text}
     """
-    Runs the full pipeline and persists the result.
 
-    Returns (ticket, was_merged_into_existing).
-    If was_merged_into_existing is True, `ticket` is the EXISTING master
-    ticket (now with an updated duplicate_count/score) — not a new row.
-    """
-    # 1. Perception — Gemini structured extraction
-    extraction = extract_from_input(
-        client, text=text, audio_bytes=audio_bytes, audio_mime_type=audio_mime_type,
-        image_bytes=image_bytes, image_mime_type=image_mime_type,
+    content_payload = [SYSTEM_PROMPT, full_prompt]
+
+    if image_bytes:
+        if isinstance(image_bytes, dict):
+            image_bytes = image_bytes.get("data", b"")
+
+        if isinstance(image_bytes, (bytes, bytearray)) and len(image_bytes) > 0:
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                content_payload.append(img)
+            except Exception as e:
+                print(f"Warning: Failed to convert image bytes: {e}")
+
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "summary_en": {"type": "STRING"},
+            "department_key": {"type": "STRING"},
+            "department_display": {"type": "STRING"},
+            "urgency": {"type": "INTEGER"},
+            "intensity": {"type": "INTEGER"},
+            "sla_hours": {"type": "INTEGER"},
+            "rpi_score": {"type": "INTEGER"},
+            "latitude": {"type": "NUMBER"},
+            "longitude": {"type": "NUMBER"}
+        },
+        "required": ["summary_en", "department_key", "department_display", "urgency", "intensity", "sla_hours", "rpi_score"]
+    }
+
+    response = client.models.generate_content(
+        model=GEMINI_MULTIMODAL_MODEL,
+        contents=content_payload,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            temperature=0.2
+        )
     )
 
-    # 1b. Evidence validation (confidence gating)
-    evidence = validate_evidence(client, extraction["summary_en"],
-                                  image_bytes=image_bytes, image_mime_type=image_mime_type)
+    return json.loads(response.text)
 
-    # 2. Routing
-    routing = match_department(extraction["summary_en"])
 
-    # 3. Clustering — only possible if we have coordinates
-    merged_ticket = None
-    new_embedding = embed_text(client, extraction["summary_en"])
-    if latitude is not None and longitude is not None:
-        candidates = list_open_tickets_with_location()
-        merged_ticket = find_duplicate_match(latitude, longitude, new_embedding, candidates)
+def create_and_store_ticket(state: str, district: str, location_note: str, user_text: str, image_bytes=None):
+    """Extract ticket data via Gemini and persist to SQLite cleanly."""
+    extracted = extract_ticket_details(user_text, state, district, location_note, image_bytes)
 
-    if merged_ticket:
-        # Bump duplicate count + rescore the existing master ticket
-        merged_ticket.duplicate_count += 1
-        scoring = score_ticket(merged_ticket.intensity, merged_ticket.urgency,
-                                merged_ticket.duplicate_count, merged_ticket.confidence)
-        merged_ticket.rpi_score = scoring["rpi_score"]
-        merged_ticket.priority_label = scoring["priority_label"]
-        merged_ticket.sla_hours = scoring["sla_hours"]
-        merged_ticket.escalation_text = scoring["escalation_text"]
-        merged_ticket.sla_deadline = stamp_deadline(merged_ticket.created_at, merged_ticket.sla_hours)
-        update_ticket(merged_ticket)
-        return merged_ticket, True
+    ticket_id = f"TICK-{uuid.uuid4().hex[:6].upper()}"
+    created_at = datetime.now().isoformat()
 
-    # 4. Scoring (new ticket)
-    intensity = extraction["suggested_intensity"]
-    urgency = extraction["suggested_urgency"]
-    scoring = score_ticket(intensity, urgency, duplicate_count=1,
-                            confidence=evidence["confidence"])
+    candidate_data = {
+        "id": ticket_id,
+        "created_at": created_at,
+        "state": state,
+        "district": district,
+        "evidence_note": location_note,
+        "raw_text": user_text,
+        "description_text": user_text,
+        "summary_en": extracted.get("summary_en"),
+        "department_key": extracted.get("department_key"),
+        "department_display": f"{extracted.get('department_display')} - {district}, {state}",
+        "urgency": extracted.get("urgency"),
+        "intensity": extracted.get("intensity"),
+        "sla_hours": extracted.get("sla_hours"),
+        "rpi_score": extracted.get("rpi_score"),
+        "latitude": extracted.get("latitude"),
+        "longitude": extracted.get("longitude"),
+        "status": "open"
+    }
 
-    ticket = Ticket(
-        raw_text=text,
-        input_channel=input_channel,
-        input_modality=input_modality,
-        summary_en=extraction["summary_en"],
-        original_language=extraction["original_language"],
-        latitude=latitude,
-        longitude=longitude,
-        confidence=evidence["confidence"],
-        evidence_note=evidence.get("reason", ""),
-        department_code=routing["department_code"],
-        department_display=routing["department_display"],
-        is_fallback_routed=routing["is_fallback_routed"],
-        intensity=intensity,
-        urgency=urgency,
-        duplicate_count=1,
-        rpi_score=scoring["rpi_score"],
-        priority_label=scoring["priority_label"],
-        sla_hours=scoring["sla_hours"],
-        escalation_text=scoring["escalation_text"],
-        status="open",
-    )
-    ticket.sla_deadline = stamp_deadline(ticket.created_at, ticket.sla_hours)
-    insert_ticket(ticket, embedding=new_embedding)
-    return ticket, False
+    # Dynamically match SQLite table columns so missing/extra keys never throw errors
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("PRAGMA table_info(tickets)")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+
+    insert_cols = [col for col in existing_cols if col in candidate_data]
+    insert_vals = [candidate_data[col] for col in insert_cols]
+
+    placeholders = ", ".join(["?"] * len(insert_cols))
+    col_names = ", ".join(insert_cols)
+
+    sql = f"INSERT INTO tickets ({col_names}) VALUES ({placeholders})"
+    cursor.execute(sql, insert_vals)
+
+    conn.commit()
+    conn.close()
+
+    return ticket_id, extracted

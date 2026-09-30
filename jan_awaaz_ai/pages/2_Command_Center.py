@@ -1,110 +1,113 @@
 """
 pages/2_Command_Center.py
-Officer-facing dashboard. Reads tickets fresh from data_store/db.py on
-every render — this is what guarantees it stays in sync with whatever the
-Citizen Portal just wrote, regardless of which browser/tab/user submitted.
-
-Also hosts the SLA Fast-Forward Simulator: a judge demo can't wait 4 real
-hours to show a CRITICAL ticket breach its SLA, so this lets you preview
-"what the dashboard looks like N hours from now" using a virtual clock.
-The virtual clock lives in st.session_state (transient UI state, per the
-rule in data_store/db.py) and is passed as `as_of` into sla_engine — it
-never touches a persisted ticket's real sla_deadline or created_at.
+Municipal Command Dashboard with Dynamic Status Tracking and Filters.
 """
 
-from datetime import datetime, timedelta, timezone
-
+import sqlite3
 import streamlit as st
+import folium
 from streamlit_folium import st_folium
+from config import DB_PATH
 
-from config import DEPARTMENTS
-from data_store.db import list_tickets
-from core.sla_engine import time_remaining_display, bucket_by_sla_state
-from utils.map_visualizer import build_ticket_map
+st.set_page_config(page_title="Command Center | Jan-Awaaz AI", page_icon="🖥️", layout="wide")
 
-st.title("🖥️ Municipal Command Center")
+st.markdown("## 🖥️ Municipal Command Center")
+st.caption("Administrative monitoring portal with live SLA calculation & urgency scores.")
 
-col_filter, col_refresh = st.columns([3, 1])
-with col_filter:
-    dept_filter = st.selectbox(
-        "Filter by department", ["All"] + [d["display_name"] for d in DEPARTMENTS.values()],
-    )
-with col_refresh:
-    st.write("")
-    if st.button("🔄 Refresh"):
-        st.rerun()
+def fetch_tickets():
+    if not DB_PATH.exists():
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM tickets ORDER BY rpi_score DESC, created_at DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
-dept_code = None
-if dept_filter != "All":
-    for code, dept in DEPARTMENTS.items():
-        if dept["display_name"] == dept_filter:
-            dept_code = code
-            break
+all_tickets = fetch_tickets()
 
-tickets = list_tickets(department_code=dept_code)
+# Sidebar Filters
+st.sidebar.markdown("### 🔍 Filter Complaints")
+depts = sorted(list(set([t.get('department_display', 'Unknown') for t in all_tickets if t.get('department_display')])))
+selected_depts = st.sidebar.multiselect("Filter by Department", depts, default=depts)
 
-# --------------------------------------------------------------------
-# SLA Fast-Forward Simulator (demo-only virtual clock)
-# --------------------------------------------------------------------
-st.subheader("⏩ SLA Fast-Forward Simulator")
-st.caption(
-    "For the demo: preview how this dashboard looks N hours from now, "
-    "without waiting in real time and without touching any real ticket "
-    "data. Resets to 'now' on page reload."
-)
+filtered_tickets = [t for t in all_tickets if t.get('department_display') in selected_depts] if selected_depts else all_tickets
 
-sim_col, reset_col = st.columns([4, 1])
-with sim_col:
-    ff_hours = st.slider(
-        "Simulate hours elapsed since submission", min_value=0, max_value=200,
-        value=st.session_state.get("ff_hours", 0), step=1, key="ff_hours",
-    )
-with reset_col:
-    st.write("")
-    if st.button("↩️ Reset to now"):
-        st.session_state["ff_hours"] = 0
-        st.rerun()
+# Live Pipeline Metrics
+st.markdown("### 📊 Governance Metrics")
+open_count = len([t for t in filtered_tickets if t.get('status') in ['open', 'reopened', None]])
+pending_verify_count = len([t for t in filtered_tickets if t.get('status') == 'pending_citizen_verification'])
+closed_count = len([t for t in filtered_tickets if t.get('status') == 'closed'])
 
-virtual_now = datetime.now(timezone.utc) + timedelta(hours=ff_hours)
-if ff_hours > 0:
-    st.info(
-        f"Showing the dashboard as it would look **{ff_hours}h from now** "
-        f"(simulated clock: {virtual_now.strftime('%Y-%m-%d %H:%M UTC')})."
-    )
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Filtered Grievances", len(filtered_tickets))
+m2.metric("Active Dept Queue", open_count)
+m3.metric("Pending Citizen Approval", pending_verify_count)
+m4.metric("Closed & Verified", closed_count)
 
-on_track, overdue = bucket_by_sla_state(tickets, as_of=virtual_now)
+st.markdown("---")
 
-st.subheader(f"{len(tickets)} active ticket(s)")
-m1, m2, m3 = st.columns(3)
-m1.metric("Total active", len(tickets))
-m2.metric("On track", len(on_track))
-m3.metric("Overdue at this clock", len(overdue), delta=None,
-          delta_color="inverse")
+# SLA Simulator
+st.markdown("### ⏩ SLA Fast-Forward Simulator")
+sim_hours = st.slider("Simulate elapsed hours since registration", 0, 72, 0, step=6)
 
-if tickets:
-    m = build_ticket_map(tickets)
-    st_folium(m, width=1100, height=500)
+active_tickets = [t for t in filtered_tickets if t.get('status') != 'closed']
+processed_tickets = []
 
-    # Overdue-first, then by RPI descending — the same "what needs eyes
-    # first" ordering an officer would want, adjusted for the virtual clock.
-    ordered = sorted(
-        tickets,
-        key=lambda t: (t not in overdue, -t.rpi_score),
-    )
+for t in active_tickets:
+    t_copy = dict(t)
+    sla = t_copy.get("sla_hours") or 24
+    if sim_hours >= sla and t_copy.get("status") != "pending_citizen_verification":
+        t_copy["calculated_status"] = "OVERDUE"
+        t_copy["map_color"] = "red"
+    else:
+        rem = max(0, sla - sim_hours)
+        t_copy["calculated_status"] = f"Pending ({rem}h left)" if t_copy.get("status") != "pending_citizen_verification" else "Pending Verification"
+        t_copy["map_color"] = "orange" if t_copy.get("status") == "pending_citizen_verification" else "blue"
+    processed_tickets.append(t_copy)
 
-    for t in ordered:
-        is_late = t in overdue
-        badge = "🔴 OVERDUE" if is_late else "🟢 On track"
-        with st.expander(
-            f"{badge} · [{t.priority_label}] {t.department_display} — "
-            f"RPI {t.rpi_score} — {t.duplicate_count} report(s)"
-        ):
-            st.write(f"**Summary:** {t.summary_en}")
-            st.write(f"**Status:** {t.status}")
-            if t.sla_deadline:
-                st.write(f"**SLA (at simulated clock):** "
-                         f"{time_remaining_display(t.sla_deadline, as_of=virtual_now)}")
-            st.write(f"**Escalation policy:** {t.escalation_text}")
-            st.write(f"**Evidence confidence:** {t.confidence}")
+# Map View
+st.markdown("### 📍 Live Spatial Heatmap")
+valid_coords = [t for t in processed_tickets if t.get("latitude") and t.get("longitude")]
+if valid_coords:
+    avg_lat = sum(float(t["latitude"]) for t in valid_coords) / len(valid_coords)
+    avg_lon = sum(float(t["longitude"]) for t in valid_coords) / len(valid_coords)
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=11)
+    for ticket in valid_coords:
+        folium.Marker(
+            [float(ticket["latitude"]), float(ticket["longitude"])],
+            popup=f"<b>{ticket['id']}</b><br>{ticket.get('department_display')}<br>Status: {ticket['calculated_status']}",
+            icon=folium.Icon(color=ticket["map_color"], icon="info-sign")
+        ).add_to(m)
+    st_folium(m, width=1200, height=350)
 else:
-    st.info("No active tickets match this filter.")
+    st.info("No active geo-tagged tickets to display on the map.")
+
+st.markdown("---")
+
+# Expandable Queue Cards
+st.markdown("### 📋 High-Priority Complaints Queue")
+for t in processed_tickets:
+    status_str = t["calculated_status"]
+    
+    if "OVERDUE" in status_str:
+        badge = "🔴 OVERDUE"
+    elif "Pending Verification" in status_str:
+        badge = "🟠 AWAITING VERIFICATION"
+    else:
+        badge = "🟢 ON TRACK"
+
+    with st.expander(f"{badge} | Ticket `{t['id']}` — RPI Priority Score: {t.get('rpi_score', 0)}", expanded=True):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown(f"**Assigned Department:** `{t.get('department_display')}`")
+            st.markdown(f"**Location:** {t.get('evidence_note') or t.get('raw_text')}")
+        with col_b:
+            st.markdown(f"**Summary:** {t.get('summary_en')}")
+            st.markdown(f"**SLA Status:** `{status_str}`")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Threat Urgency", f"{t.get('urgency', 2)} / 5")
+        c2.metric("Structural Intensity", f"{t.get('intensity', 2)} / 5")
+        c3.metric("Calculated RPI Rating", f"{t.get('rpi_score', 0)}")

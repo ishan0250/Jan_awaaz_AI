@@ -1,85 +1,70 @@
 """
 pages/1_Citizen_Portal.py
-Citizen-facing submission form. Thin — all logic delegates to
-core/ticket_pipeline.py. Writes go straight through data_store/db.py,
-never through session_state, so the Command Center sees new tickets
-immediately on its own next render.
+Citizen Grievance Submission Portal.
 """
 
 import streamlit as st
+from core.ticket_pipeline import create_and_store_ticket
 
-from core.ai_ingestion import get_client
-from core.ticket_pipeline import submit_ticket
+st.set_page_config(page_title="Citizen Portal | Jan-Awaaz AI", page_icon="📝", layout="wide")
 
-st.title("🗣️ Citizen Portal")
-st.caption("Report an issue in your own words — text, photo, or voice note.")
+st.markdown("## 📝 Citizen Grievance Portal")
+st.caption("Report civic issues in English or any Indian regional language.")
 
-with st.form("citizen_complaint_form"):
-    channel = st.selectbox(
-        "Channel (simulated)", ["web", "whatsapp", "ivr"],
-        help="Live WhatsApp/IVR integration is simulated in this build — "
-             "see README for why, given the hackathon timeframe.",
-    )
-    text_input = st.text_area(
-        "Describe the issue (any language)",
-        placeholder="Hamare ilake me bijli ka naya transformer kharab ho gaya hai...",
-    )
-    uploaded_image = st.file_uploader("Attach a photo (optional)",
-                                       type=["jpg", "jpeg", "png"])
-    uploaded_audio = st.file_uploader("Attach a voice note (optional)",
-                                       type=["ogg", "mp3", "wav", "m4a"])
+st.markdown("---")
 
-    st.markdown("**Location** — required for duplicate-clustering to work. "
-                "For live audio submissions with no GPS metadata, always "
-                "ask the citizen to confirm location explicitly like this.")
+with st.form("grievance_form", clear_on_submit=False):
     col1, col2 = st.columns(2)
     with col1:
-        latitude = st.number_input("Latitude", value=28.6139, format="%.6f")
+        state = st.selectbox("Select State / UT *", ["Uttar Pradesh", "Delhi", "Maharashtra", "Karnataka", "Tamil Nadu"])
+        district = st.text_input("District / Municipal Corporation / ULB *", value="Ghaziabad")
     with col2:
-        longitude = st.number_input("Longitude", value=77.2090, format="%.6f")
+        location_note = st.text_input("Detailed Address / Landmark *", placeholder="e.g., Near Raj Nagar Extension Flyover")
+    
+    user_text = st.text_area(
+        "Describe the Issue (Text or Regional Voice Transcription) *", 
+        height=100, 
+        placeholder="Grievance description in English, Hindi, Hinglish, Marathi, etc."
+    )
+    
+    uploaded_file = st.file_uploader("Upload Evidence Photo (Optional)", type=["jpg", "jpeg", "png"])
+    image_bytes = uploaded_file.read() if uploaded_file else None
 
-    submitted = st.form_submit_button("Submit Complaint")
+    submitted = st.form_submit_button("🚀 Submit Grievance", type="primary", use_container_width=True)
 
 if submitted:
-    if not text_input and not uploaded_image and not uploaded_audio:
-        st.error("Please provide text, a photo, or a voice note.")
+    if not state or not district or not location_note or not user_text.strip():
+        st.error("Please fill in all required fields marked with *")
     else:
-        try:
-            client = get_client()
-            image_bytes = uploaded_image.read() if uploaded_image else None
-            audio_bytes = uploaded_audio.read() if uploaded_audio else None
-
-            with st.spinner("Processing with Gemini 2.5 Flash..."):
-                ticket, was_merged = submit_ticket(
-                    client,
-                    text=text_input,
-                    input_channel=channel,
-                    input_modality=("image" if image_bytes else
-                                     "audio" if audio_bytes else "text"),
-                    image_bytes=image_bytes,
-                    audio_bytes=audio_bytes,
-                    latitude=latitude,
-                    longitude=longitude,
+        # Animated Status Spinner
+        with st.status("🧠 Processing Multimodal Grievance Input...", expanded=True) as status:
+            st.write("🔍 Parsing text and extracting spatial context...")
+            st.write("🖼️ Analyzing image evidence (if provided)...")
+            st.write("⚡ Computing RPI (Relative Priority Index) and assigning SLA...")
+            
+            try:
+                ticket_id, details = create_and_store_ticket(
+                    state=state,
+                    district=district,
+                    location_note=location_note,
+                    user_text=user_text,
+                    image_bytes=image_bytes
                 )
+                status.update(label="✅ Ticket Successfully Registered!", state="complete", expanded=False)
+                st.balloons()
 
-            if was_merged:
-                st.success(
-                    f"This matches an existing report — merged into Master "
-                    f"Ticket `{ticket.id}`. Duplicate count is now "
-                    f"{ticket.duplicate_count}, priority updated to "
-                    f"**{ticket.priority_label}** (RPI {ticket.rpi_score})."
-                )
-            else:
-                st.success(f"Ticket `{ticket.id}` created.")
+                # Clean Receipt Display
+                st.markdown("---")
+                st.subheader("🎉 Grievance Receipt")
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Ticket ID", ticket_id)
+                c2.metric("Assigned SLA", f"{details.get('sla_hours', 24)} Hours")
+                c3.metric("RPI Priority Rating", f"{details.get('rpi_score', 0)} / 75")
 
-            st.write(f"**Routed to:** {ticket.department_display}"
-                      + (" _(fail-safe routing — unclassified issue)_"
-                         if ticket.is_fallback_routed else ""))
-            st.write(f"**Priority:** {ticket.priority_label} "
-                      f"(RPI {ticket.rpi_score}) · SLA: {ticket.sla_hours}h")
-            st.write(f"**Summary:** {ticket.summary_en}")
-            st.write(f"**Evidence confidence:** {ticket.confidence} "
-                      f"— {ticket.evidence_note}")
+                st.info(f"**Assigned Department:** {details.get('department_display')}")
+                st.write(f"**Generated English Summary:** {details.get('summary_en')}")
 
-        except RuntimeError as exc:
-            st.error(str(exc))
+            except Exception as e:
+                status.update(label="❌ Error processing grievance", state="error")
+                st.error(f"Failed to submit ticket: {str(e)}")

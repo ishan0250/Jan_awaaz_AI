@@ -1,77 +1,108 @@
 """
 app.py
-Entrypoint only. All business logic lives in core/ and data_store/; all
-page content lives in pages/ (Streamlit's native multipage system, which
-replaces manual tab-switching and avoids a class of session_state bugs).
-
-Run with: streamlit run app.py
+Jan-Awaaz AI - Main Entry Point & Global Styling.
 """
 
-import io
-
-import qrcode
 import streamlit as st
-from dotenv import load_dotenv
-
 from data_store.db import init_db
-from data_store.seed_data import load_seed_data_if_empty
-from core.whatsapp_gateway import build_click_to_chat_link
 
-load_dotenv()
-
-st.set_page_config(page_title="Jan-Awaaz AI", page_icon="📢", layout="wide")
-
-# Idempotent: safe to call on every rerun.
-init_db()
-inserted = load_seed_data_if_empty()
-
-st.title("📢 Jan-Awaaz AI — Smart Civic Grievance & Service Router")
-st.caption("SIH 2026 · Student Innovation Track · Governance / Smart Automation")
-
-st.markdown(
-    """
-Use the sidebar to navigate:
-
-- **Citizen Portal** — submit a complaint by text, photo, or (simulated) voice note.
-- **Command Center** — municipal officer view: live map, priorities, SLA clocks.
-- **Verification Portal** — citizens confirm or reject a marked-resolved ticket.
-- **Compliance Reference Drawer** — the scoring methodology and framework references,
-  for the judges' Q&A round.
-"""
+# Page Setup
+st.set_page_config(
+    page_title="Jan-Awaaz AI | Civic Grievance Portal",
+    page_icon="🏛️",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-if inserted:
-    st.info(f"Loaded {inserted} seed demo tickets into the database.")
+# Initialize Database Schema
+init_db()
 
-st.divider()
-st.subheader("📱 Zero-Install Access via WhatsApp")
-st.caption("No app to build or install — citizens click a link and their "
-           "own WhatsApp opens with a pre-filled message. This is a real "
-           "click-to-chat link, works today, no backend required.")
+# Global Custom CSS for Visual Polish
+st.markdown("""
+<style>
+    /* Main Background & Fonts */
+    .stApp {
+        background-color: #f8fafc;
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+    
+    /* Header Styling */
+    .main-header {
+        background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
+        padding: 1.5rem 2rem;
+        border-radius: 12px;
+        color: white;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+    .main-header h1 {
+        color: white !important;
+        font-weight: 700;
+        margin: 0;
+        font-size: 2.2rem;
+    }
+    .main-header p {
+        color: #e2e8f0;
+        margin: 0.5rem 0 0 0;
+        font-size: 1rem;
+    }
 
-col_link, col_qr = st.columns([2, 1])
-with col_link:
-    link = build_click_to_chat_link()
-    st.code(link, language=None)
-    st.markdown(f"[Open in WhatsApp]({link})")
-    st.caption(
-        "For the LIVE demo (real send/receive, not just the link), run "
-        "`uvicorn webhook_server:app --port 8000` alongside this app and "
-        "expose it via ngrok — see README.md 'WhatsApp Channel'. Requires "
-        "a free Meta developer test number; no business verification needed."
-    )
-with col_qr:
-    qr_img = qrcode.make(link)
-    buf = io.BytesIO()
-    qr_img.save(buf, format="PNG")
-    st.image(buf.getvalue(), caption="Scan to open WhatsApp", width=160)
+    /* Metric Card Styling */
+    div[data-testid="stMetric"] {
+        background-color: #ffffff;
+        border: 1px solid #e2e8f0;
+        padding: 1rem;
+        border-radius: 10px;
+        box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+    }
 
-with st.expander("⚠️ Setup checklist (remove before final demo)"):
-    st.markdown(
-        """
-1. `pip install -r requirements.txt`
-2. Copy `.env.example` to `.env` and add your `GEMINI_API_KEY`
-3. `streamlit run app.py`
-4. Delete `data/jan_awaaz.db` any time to reset the demo to seed data.
-"""
-    )
+    /* Status Badges */
+    .badge-overdue {
+        background-color: #fee2e2;
+        color: #991b1b;
+        padding: 0.25rem 0.75rem;
+        border-radius: 9999px;
+        font-weight: 600;
+        font-size: 0.85rem;
+        border: 1px solid #fca5a5;
+    }
+    .badge-pending {
+        background-color: #fef3c7;
+        color: #92400e;
+        padding: 0.25rem 0.75rem;
+        border-radius: 9999px;
+        font-weight: 600;
+        font-size: 0.85rem;
+        border: 1px solid #fde68a;
+    }
+    .badge-closed {
+        background-color: #dcfce7;
+        color: #166534;
+        padding: 0.25rem 0.75rem;
+        border-radius: 9999px;
+        font-weight: 600;
+        font-size: 0.85rem;
+        border: 1px solid #86efac;
+    }
+
+    /* Container Card Polish */
+    .card-box {
+        background-color: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Main Banner
+st.markdown("""
+<div class="main-header">
+    <h1>🏛️ Jan-Awaaz AI</h1>
+    <p>Multimodal Civic Grievance Redressal & Priority Intelligence Platform</p>
+</div>
+""", unsafe_allow_html=True)
+
+st.success("✅ System operational. Use the left sidebar navigation to access Citizen Portal, Command Center, or Verification Portal.")
